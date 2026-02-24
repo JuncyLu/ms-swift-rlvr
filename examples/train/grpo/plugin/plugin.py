@@ -21,6 +21,7 @@ from swift.template import Template
 from swift.template.template_inputs import StdTemplateInputs
 from swift.trainers import disable_gradient_checkpointing
 from swift.utils import get_logger, to_device
+from swift.model.utils import AttnImpl
 
 logger = get_logger()
 """
@@ -154,6 +155,7 @@ class DDAPOAttentionORM(ORM):
         self.eps = eps
         self._warned_missing = False
         self._warned_attn = False
+        self._debug_done = False
 
     def __call__(self, completions, **kwargs) -> List[float]:
         model = kwargs.get('policy_model') or kwargs.get('model')
@@ -206,9 +208,17 @@ class DDAPOAttentionORM(ORM):
             # Temporarily disable gradient checkpointing so forward returns attentions (required for DDAPO TDR).
             inner_model = getattr(model, 'module', model)
             gcp_kwargs = kwargs.get('gradient_checkpointing_kwargs')
-            with torch.no_grad(), template.forward_context(model, batch), disable_gradient_checkpointing(
-                    inner_model, gcp_kwargs):
-                outputs = model(**model_kwargs)
+            if idx == 0 and not self._debug_done:
+                self._debug_attn_state(model_kwargs, inner_model)
+                self._debug_done = True
+
+            saved_attn_impl = self._set_attn_impl_eager(inner_model)
+            try:
+                with torch.no_grad(), template.forward_context(model, batch), disable_gradient_checkpointing(
+                        inner_model, gcp_kwargs):
+                    outputs = model(**model_kwargs)
+            finally:
+                self._restore_attn_impl(saved_attn_impl)
 
             attentions = getattr(outputs, 'attentions', None)
             if attentions is None:
@@ -221,6 +231,52 @@ class DDAPOAttentionORM(ORM):
             tdr = self._compute_tdr(attentions, batch, processor, model)
             rewards.append(-float(tdr) if tdr is not None else 0.0)
         return rewards
+
+    def _debug_attn_state(self, model_kwargs: Dict[str, torch.Tensor], inner_model) -> None:
+        keys = sorted(model_kwargs.keys())
+        has_output_attn = 'output_attentions' in model_kwargs
+        logger.info('[DDAPO_DEBUG] model_kwargs keys: %s', keys)
+        logger.info('[DDAPO_DEBUG] output_attentions=%s', model_kwargs.get('output_attentions', None))
+        logger.info('[DDAPO_DEBUG] gradient_checkpointing=%s', getattr(inner_model, 'gradient_checkpointing', None))
+        logger.info('[DDAPO_DEBUG] config.gradient_checkpointing=%s',
+                    getattr(getattr(inner_model, 'config', None), 'gradient_checkpointing', None))
+
+        def _log_config(prefix: str, cfg):
+            if cfg is None:
+                return
+            for key in AttnImpl.attn_impl_keys:
+                if hasattr(cfg, key):
+                    logger.info('[DDAPO_DEBUG] %s.%s=%s', prefix, key, getattr(cfg, key))
+
+        _log_config('config', getattr(inner_model, 'config', None))
+        _log_config('config.text_config', getattr(getattr(inner_model, 'config', None), 'text_config', None))
+
+    def _set_attn_impl_eager(self, inner_model):
+        saved = []
+        configs = []
+        config = getattr(inner_model, 'config', None)
+        if config is not None:
+            configs.append(('config', config))
+            text_config = getattr(config, 'text_config', None)
+            if text_config is not None:
+                configs.append(('config.text_config', text_config))
+
+        for cfg_name, cfg in configs:
+            for key in AttnImpl.attn_impl_keys:
+                if hasattr(cfg, key):
+                    old = getattr(cfg, key)
+                    saved.append((cfg, key, old))
+                    setattr(cfg, key, 'eager')
+        return saved
+
+    def _restore_attn_impl(self, saved) -> None:
+        if not saved:
+            return
+        for cfg, key, old in saved:
+            try:
+                setattr(cfg, key, old)
+            except Exception:
+                pass
 
     def _build_model_kwargs(self, model, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if not hasattr(model, 'forward'):
