@@ -19,6 +19,7 @@ from swift.rollout.gym_env import ContextManager, Env, context_managers, envs
 from swift.rollout.multi_turn import MultiTurnScheduler, multi_turns
 from swift.template import Template
 from swift.template.template_inputs import StdTemplateInputs
+from swift.trainers import disable_gradient_checkpointing
 from swift.utils import get_logger, to_device
 
 logger = get_logger()
@@ -202,7 +203,11 @@ class DDAPOAttentionORM(ORM):
 
             model_kwargs = self._build_model_kwargs(model, batch)
 
-            with torch.no_grad(), template.forward_context(model, batch):
+            # Temporarily disable gradient checkpointing so forward returns attentions (required for DDAPO TDR).
+            inner_model = getattr(model, 'module', model)
+            gcp_kwargs = kwargs.get('gradient_checkpointing_kwargs')
+            with torch.no_grad(), template.forward_context(model, batch), disable_gradient_checkpointing(
+                    inner_model, gcp_kwargs):
                 outputs = model(**model_kwargs)
 
             attentions = getattr(outputs, 'attentions', None)

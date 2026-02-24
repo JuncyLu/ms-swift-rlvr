@@ -338,6 +338,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             'policy_model': self.model,
             'template': self.template,
             'processor': getattr(self.template, 'processor', None),
+            'gradient_checkpointing_kwargs': getattr(self.args, 'gradient_checkpointing_kwargs', None),
         }
         reward_inputs = [{k: v for k, v in inp.items() if k != 'add_eos'} for inp in inputs]
         if self.enable_server_multi_turn:

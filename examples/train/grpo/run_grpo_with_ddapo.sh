@@ -10,7 +10,7 @@ swift rlhf \
     --external_plugins examples/train/grpo/plugin/plugin.py \
     --reward_funcs ddapo_attention external_r1v_acc format \
     --use_vllm false \
-    --tuner_type full \
+    --tuner_type qlora \
     --torch_dtype bfloat16 \
     --dataset 'AI-ModelScope/clevr_cogen_a_train' \
     --overlong_filter false \
@@ -31,11 +31,11 @@ swift rlhf \
     --num_generations 2 \
     --temperature 1.0 \
     --system 'examples/train/grpo/prompt.txt' \
-    --deepspeed zero1 \
+    --deepspeed zero3 \
     --log_completions true \
     --report_to tensorboard \
     --num_iterations 1 \
     --async_generate false \
-    --beta 0.001 \
+    --beta 0 \
     --loss_type grpo \
     --advantage_estimator grpo

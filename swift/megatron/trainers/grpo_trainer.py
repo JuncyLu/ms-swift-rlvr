@@ -646,6 +646,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'policy_model': self.model,
             'template': self.template,
             'processor': getattr(self.template, 'processor', None),
+            'gradient_checkpointing_kwargs': getattr(self.args, 'gradient_checkpointing_kwargs', None),
         }
         reward_kwargs.update(RowPreprocessor.rows_to_batched(batch))
 
