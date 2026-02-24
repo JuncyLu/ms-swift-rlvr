@@ -22,6 +22,8 @@ from swift.template.template_inputs import StdTemplateInputs
 from swift.trainers import disable_gradient_checkpointing
 from swift.utils import get_logger, to_device
 from swift.model.utils import AttnImpl
+from accelerate.utils import extract_model_from_parallel
+from peft import PeftModel
 
 logger = get_logger()
 """
@@ -253,20 +255,16 @@ class DDAPOAttentionORM(ORM):
 
     def _set_attn_impl_eager(self, inner_model):
         saved = []
-        configs = []
-        config = getattr(inner_model, 'config', None)
-        if config is not None:
-            configs.append(('config', config))
-            text_config = getattr(config, 'text_config', None)
-            if text_config is not None:
-                configs.append(('config.text_config', text_config))
-
-        for cfg_name, cfg in configs:
+        for cfg in self._get_attn_config_targets(inner_model):
             for key in AttnImpl.attn_impl_keys:
                 if hasattr(cfg, key):
                     old = getattr(cfg, key)
                     saved.append((cfg, key, old))
                     setattr(cfg, key, 'eager')
+            if hasattr(cfg, 'output_attentions'):
+                old = getattr(cfg, 'output_attentions')
+                saved.append((cfg, 'output_attentions', old))
+                setattr(cfg, 'output_attentions', True)
         return saved
 
     def _restore_attn_impl(self, saved) -> None:
@@ -277,6 +275,34 @@ class DDAPOAttentionORM(ORM):
                 setattr(cfg, key, old)
             except Exception:
                 pass
+
+    def _get_attn_config_targets(self, inner_model):
+        targets = []
+        seen = set()
+
+        def _add_cfg(cfg):
+            if cfg is None:
+                return
+            if id(cfg) in seen:
+                return
+            seen.add(id(cfg))
+            targets.append(cfg)
+
+        model = extract_model_from_parallel(inner_model)
+        if isinstance(model, PeftModel):
+            base = model.get_base_model() if hasattr(model, 'get_base_model') else model.base_model
+            model = getattr(base, 'model', base)
+
+        _add_cfg(getattr(model, 'config', None))
+        text_cfg = getattr(getattr(model, 'config', None), 'text_config', None)
+        _add_cfg(text_cfg)
+
+        if hasattr(model, 'model'):
+            _add_cfg(getattr(model.model, 'config', None))
+            _add_cfg(getattr(getattr(model.model, 'config', None), 'text_config', None))
+        if hasattr(model, 'language_model'):
+            _add_cfg(getattr(model.language_model, 'config', None))
+        return targets
 
     def _build_model_kwargs(self, model, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if not hasattr(model, 'forward'):
