@@ -333,7 +333,12 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         completions = [inp['messages'][-1]['content'] for inp in inputs]
 
         # Common reward kwargs
-        reward_kwargs = {'trainer_state': self.state}
+        reward_kwargs = {
+            'trainer_state': self.state,
+            'policy_model': self.model,
+            'template': self.template,
+            'processor': getattr(self.template, 'processor', None),
+        }
         reward_inputs = [{k: v for k, v in inp.items() if k != 'add_eos'} for inp in inputs]
         if self.enable_server_multi_turn:
             trajectory_inputs = self._get_trajectory_inputs(inputs)

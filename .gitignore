@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
+trl_DAPO/
+DDAPO.pdf
 tmp
 *.ttf
 __pycache__/

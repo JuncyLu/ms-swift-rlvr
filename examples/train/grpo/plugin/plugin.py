@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import random
@@ -17,6 +18,7 @@ from swift.rewards.rm_plugin import DefaultRMPlugin
 from swift.rollout.gym_env import ContextManager, Env, context_managers, envs
 from swift.rollout.multi_turn import MultiTurnScheduler, multi_turns
 from swift.template import Template
+from swift.template.template_inputs import StdTemplateInputs
 from swift.utils import get_logger, to_device
 
 logger = get_logger()
@@ -137,6 +139,201 @@ class MultiModalAccuracyORM(ORM):
 
 
 orms['external_r1v_acc'] = MultiModalAccuracyORM
+
+
+class DDAPOAttentionORM(ORM):
+    """DDAPO attention-based reward using Text-Dominance Ratio (TDR).
+
+    Computes TDR from prompt-sliced attention (Eq. 1-3 in DDAPO) and returns
+    a scalar reward that favors lower TDR (more visual grounding).
+    """
+
+    def __init__(self, k_layers: int = 8, eps: float = 1e-6):
+        self.k_layers = k_layers
+        self.eps = eps
+        self._warned_missing = False
+        self._warned_attn = False
+
+    def __call__(self, completions, **kwargs) -> List[float]:
+        model = kwargs.get('policy_model') or kwargs.get('model')
+        template = kwargs.get('template')
+        processor = kwargs.get('processor') or getattr(template, 'processor', None)
+
+        if model is None or template is None or processor is None:
+            if not self._warned_missing:
+                logger.warning(
+                    'DDAPOAttentionORM requires policy_model + template + processor in reward kwargs. '
+                    'Returning 0.0 rewards.')
+                self._warned_missing = True
+            return [0.0 for _ in completions]
+
+        messages_list = kwargs.get('messages')
+        if messages_list is None:
+            if not self._warned_missing:
+                logger.warning('DDAPOAttentionORM requires messages in reward kwargs. Returning 0.0 rewards.')
+                self._warned_missing = True
+            return [0.0 for _ in completions]
+
+        rewards: List[float] = []
+        for idx, completion in enumerate(completions):
+            row = {}
+            for key in ['messages', 'images', 'videos', 'audios', 'tools', 'objects', 'mm_processor_kwargs']:
+                if key in kwargs and kwargs[key] is not None:
+                    row[key] = kwargs[key][idx]
+            if 'messages' not in row or row['messages'] is None:
+                rewards.append(0.0)
+                continue
+
+            messages = deepcopy(row['messages'])
+            if messages and messages[-1]['role'] == 'assistant':
+                messages[-1]['content'] = completion
+            else:
+                messages.append({'role': 'assistant', 'content': completion})
+            row['messages'] = messages
+
+            std_inputs = StdTemplateInputs.from_dict(row)
+            encoded = template._encode_truncated(std_inputs)
+            if encoded.get('input_ids') is None or encoded.get('labels') is None:
+                rewards.append(0.0)
+                continue
+
+            batch = template._data_collator([encoded])
+            batch = to_device(batch, model.device)
+
+            model_kwargs = self._build_model_kwargs(model, batch)
+
+            with torch.no_grad(), template.forward_context(model, batch):
+                outputs = model(**model_kwargs)
+
+            attentions = getattr(outputs, 'attentions', None)
+            if attentions is None:
+                if not self._warned_attn:
+                    logger.warning('DDAPOAttentionORM: model outputs did not include attentions. Returning 0.0 reward.')
+                    self._warned_attn = True
+                rewards.append(0.0)
+                continue
+
+            tdr = self._compute_tdr(attentions, batch, processor, model)
+            rewards.append(-float(tdr) if tdr is not None else 0.0)
+        return rewards
+
+    def _build_model_kwargs(self, model, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if not hasattr(model, 'forward'):
+            return batch
+        try:
+            sig = inspect.signature(model.forward)
+            params = sig.parameters
+            keys = params.keys()
+            has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        except Exception:
+            return batch
+        kwargs = {k: v for k, v in batch.items() if k in keys or has_kwargs}
+        if 'output_attentions' in keys or has_kwargs:
+            kwargs['output_attentions'] = True
+        if 'use_cache' in keys or has_kwargs:
+            kwargs['use_cache'] = False
+        if 'return_dict' in keys or has_kwargs:
+            kwargs['return_dict'] = True
+        return kwargs
+
+    def _collect_visual_token_ids(self, processor, model) -> List[int]:
+        ids = set()
+        candidates = [
+            'image_token_id',
+            'image_token_ids',
+            'image_start_token_id',
+            'image_end_token_id',
+            'image_patch_token_id',
+            'image_patch_token_ids',
+            'image_pad_token_id',
+        ]
+        for attr in candidates:
+            for obj in [processor, getattr(processor, 'image_processor', None), getattr(model, 'config', None), model]:
+                if obj is None:
+                    continue
+                val = getattr(obj, attr, None)
+                if val is None:
+                    continue
+                if isinstance(val, (list, tuple, set)):
+                    ids.update(int(x) for x in val)
+                else:
+                    ids.add(int(val))
+
+        token_candidates = ['image_token', 'image_start_token', 'image_end_token', 'image_patch_token']
+        tokenizer = getattr(processor, 'tokenizer', None)
+        if tokenizer is not None:
+            for attr in token_candidates:
+                tok = getattr(processor, attr, None)
+                if tok is None:
+                    continue
+                if isinstance(tok, (list, tuple)):
+                    ids.update(tokenizer.convert_tokens_to_ids(list(tok)))
+                else:
+                    ids.add(int(tokenizer.convert_tokens_to_ids(tok)))
+        return [i for i in ids if i is not None and i >= 0]
+
+    def _compute_tdr(self, attentions, batch: Dict[str, torch.Tensor], processor, model) -> Union[float, None]:
+        # attentions: list of (B, H, S, S)
+        input_ids = batch.get('input_ids')
+        labels = batch.get('labels')
+        attention_mask = batch.get('attention_mask')
+        if input_ids is None or labels is None:
+            return None
+
+        input_ids = input_ids[0]
+        labels = labels[0]
+        if attention_mask is not None:
+            attention_mask = attention_mask[0]
+        else:
+            attention_mask = torch.ones_like(labels, dtype=torch.long)
+
+        output_mask = (labels != -100) & (attention_mask == 1)
+        prompt_mask = (labels == -100) & (attention_mask == 1)
+        if output_mask.sum() == 0 or prompt_mask.sum() == 0:
+            return None
+
+        visual_token_ids = self._collect_visual_token_ids(processor, model)
+        # Construct visual mask via ids; non-visual in prompt treated as text
+        if not visual_token_ids:
+            return None
+        visual_mask = torch.isin(input_ids, torch.tensor(visual_token_ids, device=input_ids.device))
+
+        prompt_idx = prompt_mask.nonzero(as_tuple=False).squeeze(-1)
+        vis_in_prompt = visual_mask[prompt_idx]
+        text_in_prompt = ~vis_in_prompt
+
+        num_vis = int(vis_in_prompt.sum().item())
+        num_text = int(text_in_prompt.sum().item())
+        if num_vis == 0 or num_text == 0:
+            return None
+
+        k_layers = min(self.k_layers, len(attentions))
+        attn_stack = torch.stack(attentions[-k_layers:], dim=0)  # (K, B, H, S, S)
+        attn_stack = attn_stack[:, 0]  # (K, H, S, S)
+        attn_mean = attn_stack.mean(dim=1)  # (K, S, S)
+
+        rho_vis_list = []
+        rho_text_list = []
+        output_idx = output_mask.nonzero(as_tuple=False).squeeze(-1)
+        for t in output_idx:
+            attn_t = attn_mean[:, t, :]  # (K, S)
+            attn_prompt = attn_t[:, prompt_idx]  # (K, P)
+            denom = attn_prompt.sum(dim=-1, keepdim=True) + self.eps
+            attn_prompt = attn_prompt / denom
+
+            attn_vis_t = attn_prompt[:, vis_in_prompt].sum(dim=-1).mean()
+            attn_text_t = attn_prompt[:, text_in_prompt].sum(dim=-1).mean()
+
+            rho_vis_list.append(attn_vis_t / float(num_vis))
+            rho_text_list.append(attn_text_t / float(num_text))
+
+        rho_vis = torch.stack(rho_vis_list).mean()
+        rho_text = torch.stack(rho_text_list).mean()
+        tdr = rho_text / (rho_vis + self.eps)
+        return tdr.detach().item()
+
+
+orms['ddapo_attention'] = DDAPOAttentionORM
 
 
 class MultiTurnThinkingTips(ORM):

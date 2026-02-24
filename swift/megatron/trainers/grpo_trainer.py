@@ -641,7 +641,12 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         completions = [inp['messages'][-1]['content'] for inp in batch]
 
         # Common reward kwargs
-        reward_kwargs = {'trainer_state': self.state}
+        reward_kwargs = {
+            'trainer_state': self.state,
+            'policy_model': self.model,
+            'template': self.template,
+            'processor': getattr(self.template, 'processor', None),
+        }
         reward_kwargs.update(RowPreprocessor.rows_to_batched(batch))
 
         # Use pre-computed indices for async reward functions
