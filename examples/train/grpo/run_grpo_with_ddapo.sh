@@ -10,7 +10,7 @@ swift rlhf \
     --external_plugins examples/train/grpo/plugin/plugin.py \
     --reward_funcs ddapo_attention external_r1v_acc format \
     --use_vllm false \
-    --tuner_type qlora \
+    --tuner_type lora \
     --torch_dtype bfloat16 \
     --dataset 'AI-ModelScope/clevr_cogen_a_train' \
     --overlong_filter false \
@@ -27,7 +27,7 @@ swift rlhf \
     --save_steps 1000 \
     --save_total_limit 2 \
     --logging_steps 1 \
-    --dataloader_num_workers 2 \
+    --dataloader_num_workers 16 \
     --num_generations 2 \
     --temperature 1.0 \
     --system 'examples/train/grpo/prompt.txt' \
