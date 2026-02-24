@@ -19,16 +19,16 @@ swift rlhf \
     --epsilon_high 0.28 \
     --max_completion_length 512 \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 1 \
+    --per_device_train_batch_size 2 \
     --learning_rate 1e-6 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 2 \
     --steps_per_generation 1 \
     --eval_steps 1000 \
     --save_steps 1000 \
     --save_total_limit 2 \
     --logging_steps 1 \
     --dataloader_num_workers 16 \
-    --num_generations 2 \
+    --num_generations 4 \
     --temperature 1.0 \
     --system 'examples/train/grpo/prompt.txt' \
     --deepspeed zero3 \
