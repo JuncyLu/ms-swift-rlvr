@@ -152,9 +152,10 @@ class DDAPOAttentionORM(ORM):
     a scalar reward that favors lower TDR (more visual grounding).
     """
 
-    def __init__(self, k_layers: int = 8, eps: float = 1e-6):
+    def __init__(self, k_layers: int = 8, eps: float = 1e-6, debug_samples: int = 10):
         self.k_layers = k_layers
         self.eps = eps
+        self.debug_samples = debug_samples
         self._warned_missing = False
         self._warned_attn = False
         self._debug_done = False
@@ -206,6 +207,7 @@ class DDAPOAttentionORM(ORM):
             batch = to_device(batch, model.device)
 
             model_kwargs = self._build_model_kwargs(model, batch)
+            system_len = self._estimate_system_prefix_len_from_row(row, template)
 
             # Temporarily disable gradient checkpointing so forward returns attentions (required for DDAPO TDR).
             inner_model = getattr(model, 'module', model)
@@ -230,8 +232,10 @@ class DDAPOAttentionORM(ORM):
                 rewards.append(0.0)
                 continue
 
-            tdr = self._compute_tdr(attentions, batch, processor, model)
+            tdr, debug_payload = self._compute_tdr(attentions, batch, processor, model, system_len)
             rewards.append(-float(tdr) if tdr is not None else 0.0)
+            if debug_payload is not None and idx < self.debug_samples:
+                logger.info('[DDAPO_DEBUG] %s', json.dumps(debug_payload, ensure_ascii=False))
         return rewards
 
     def _debug_attn_state(self, model_kwargs: Dict[str, torch.Tensor], inner_model) -> None:
@@ -359,7 +363,7 @@ class DDAPOAttentionORM(ORM):
                     ids.add(int(tokenizer.convert_tokens_to_ids(tok)))
         return [i for i in ids if i is not None and i >= 0]
 
-    def _compute_tdr(self, attentions, batch: Dict[str, torch.Tensor], processor, model) -> Union[float, None]:
+    def _compute_tdr(self, attentions, batch: Dict[str, torch.Tensor], processor, model, system_len: int):
         # attentions: list of (B, H, S, S)
         input_ids = batch.get('input_ids')
         labels = batch.get('labels')
@@ -377,12 +381,19 @@ class DDAPOAttentionORM(ORM):
         output_mask = (labels != -100) & (attention_mask == 1)
         prompt_mask = (labels == -100) & (attention_mask == 1)
         if output_mask.sum() == 0 or prompt_mask.sum() == 0:
-            return None
+            return None, None
+
+        if system_len > 0:
+            system_prefix_mask = torch.zeros_like(prompt_mask, dtype=torch.bool)
+            system_prefix_mask[:system_len] = True
+            prompt_mask = prompt_mask & (~system_prefix_mask)
+            if prompt_mask.sum() == 0:
+                return None, None
 
         visual_token_ids = self._collect_visual_token_ids(processor, model)
         # Construct visual mask via ids; non-visual in prompt treated as text
         if not visual_token_ids:
-            return None
+            return None, None
         visual_mask = torch.isin(input_ids, torch.tensor(visual_token_ids, device=input_ids.device))
 
         prompt_idx = prompt_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -392,7 +403,7 @@ class DDAPOAttentionORM(ORM):
         num_vis = int(vis_in_prompt.sum().item())
         num_text = int(text_in_prompt.sum().item())
         if num_vis == 0 or num_text == 0:
-            return None
+            return None, None
 
         k_layers = min(self.k_layers, len(attentions))
         attn_stack = torch.stack(attentions[-k_layers:], dim=0)  # (K, B, H, S, S)
@@ -417,7 +428,78 @@ class DDAPOAttentionORM(ORM):
         rho_vis = torch.stack(rho_vis_list).mean()
         rho_text = torch.stack(rho_text_list).mean()
         tdr = rho_text / (rho_vis + self.eps)
-        return tdr.detach().item()
+        debug_payload = None
+        if self.debug_samples > 0:
+            debug_payload = self._build_debug_payload(
+                attentions=attentions,
+                input_ids=input_ids,
+                output_idx=output_idx,
+                prompt_idx=prompt_idx,
+                vis_in_prompt=vis_in_prompt,
+                text_in_prompt=text_in_prompt,
+                system_len=system_len,
+            )
+        return tdr.detach().item(), debug_payload
+
+    def _estimate_system_prefix_len_from_row(self, row: Dict[str, List], template) -> int:
+        if row.get('messages') is None:
+            return 0
+        std_inputs_full = StdTemplateInputs.from_dict(row)
+        encoded_full = template._encode_truncated(std_inputs_full)
+        full_ids = encoded_full.get('input_ids')
+        if full_ids is None:
+            return 0
+
+        row_no_sys = deepcopy(row)
+        messages = row_no_sys.get('messages') or []
+        if messages and messages[0].get('role') == 'system':
+            messages = messages[1:]
+        row_no_sys['messages'] = messages
+
+        std_inputs_no_sys = StdTemplateInputs.from_dict(row_no_sys)
+        std_inputs_no_sys.system = ''  # avoid default system
+        encoded_no_sys = template._encode_truncated(std_inputs_no_sys)
+        no_sys_ids = encoded_no_sys.get('input_ids')
+        if no_sys_ids is None:
+            return 0
+        if len(no_sys_ids) >= len(full_ids):
+            return 0
+        if full_ids[-len(no_sys_ids):] == no_sys_ids:
+            return len(full_ids) - len(no_sys_ids)
+        return 0
+
+    def _build_debug_payload(self, attentions, input_ids, output_idx, prompt_idx, vis_in_prompt, text_in_prompt,
+                             system_len: int):
+        # Full attention matrices: per-layer, averaged over heads, for generated tokens.
+        attn_by_layer = []
+        layer_text_means = []
+        layer_vis_means = []
+        for layer_attn in attentions:
+            layer_attn = layer_attn[0].mean(dim=0)  # (S, S)
+            attn_by_layer.append(layer_attn[output_idx].tolist())
+            attn_prompt = layer_attn[output_idx][:, prompt_idx]  # (T, P)
+            if attn_prompt.numel() == 0:
+                layer_text_means.append(0.0)
+                layer_vis_means.append(0.0)
+            else:
+                vis_mask = vis_in_prompt
+                text_mask = text_in_prompt
+                vis_vals = attn_prompt[:, vis_mask]
+                text_vals = attn_prompt[:, text_mask]
+                layer_vis_means.append(float(vis_vals.mean().item()) if vis_vals.numel() > 0 else 0.0)
+                layer_text_means.append(float(text_vals.mean().item()) if text_vals.numel() > 0 else 0.0)
+
+        return {
+            'system_prefix_tokens': int(system_len),
+            'prompt_text_tokens': int(text_in_prompt.sum().item()),
+            'prompt_visual_tokens': int(vis_in_prompt.sum().item()),
+            'prompt_total_tokens': int(prompt_idx.numel()),
+            'generated_tokens': int(output_idx.numel()),
+            'attn_shape': [len(attentions), int(output_idx.numel()), int(input_ids.numel())],
+            'attn_prompt_text_mean_by_layer': layer_text_means,
+            'attn_prompt_vis_mean_by_layer': layer_vis_means,
+            'attn_full': attn_by_layer,
+        }
 
 
 orms['ddapo_attention'] = DDAPOAttentionORM
