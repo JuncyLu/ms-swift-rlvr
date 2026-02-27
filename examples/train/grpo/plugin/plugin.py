@@ -159,6 +159,7 @@ class DDAPOAttentionORM(ORM):
         self._warned_missing = False
         self._warned_attn = False
         self._debug_done = False
+        self.debug_log_path = os.environ.get('DDAPO_DEBUG_LOG', 'ddapo_attention_debug.log')
 
     def __call__(self, completions, **kwargs) -> List[float]:
         model = kwargs.get('policy_model') or kwargs.get('model')
@@ -235,7 +236,7 @@ class DDAPOAttentionORM(ORM):
             tdr, debug_payload = self._compute_tdr(attentions, batch, processor, model, system_len)
             rewards.append(-float(tdr) if tdr is not None else 0.0)
             if debug_payload is not None and idx < self.debug_samples:
-                logger.info('[DDAPO_DEBUG] %s', json.dumps(debug_payload, ensure_ascii=False))
+                self._write_debug_payload(debug_payload)
         return rewards
 
     def _debug_attn_state(self, model_kwargs: Dict[str, torch.Tensor], inner_model) -> None:
@@ -500,6 +501,16 @@ class DDAPOAttentionORM(ORM):
             'attn_prompt_vis_mean_by_layer': layer_vis_means,
             'attn_full': attn_by_layer,
         }
+
+    def _write_debug_payload(self, payload: Dict) -> None:
+        # Only rank 0 writes to avoid duplicate logs.
+        if os.environ.get('RANK', '0') != '0':
+            return
+        try:
+            with open(self.debug_log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + '\n')
+        except Exception as e:
+            logger.warning('[DDAPO_DEBUG] Failed to write debug payload: %s', e)
 
 
 orms['ddapo_attention'] = DDAPOAttentionORM
