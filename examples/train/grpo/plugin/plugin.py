@@ -158,6 +158,9 @@ class DDAPOAttentionORM(ORM):
         self._warned_missing = False
         self._warned_attn = False
         self._debug_done = False
+        self._debug_n = int(os.environ.get('DDAPO_DEBUG_N', '10'))
+        self._debug_log_path = os.environ.get('DDAPO_DEBUG_LOG', 'ddapo_attention_debug.log')
+        self._debug_logged_count = 0
 
     def __call__(self, completions, **kwargs) -> List[float]:
         model = kwargs.get('policy_model') or kwargs.get('model')
@@ -231,8 +234,19 @@ class DDAPOAttentionORM(ORM):
                 rewards.append(0.0)
                 continue
 
-            tdr, _ = self._compute_tdr(attentions, batch, processor, model, system_len)
+            is_rank0 = (int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', 0))) == 0)
+            want_debug = is_rank0 and (self._debug_logged_count < self._debug_n)
+            tdr, debug_dict = self._compute_tdr(attentions, batch, processor, model, system_len,
+                                                return_debug=want_debug)
             rewards.append(-float(tdr) if tdr is not None else 0.0)
+
+            if debug_dict is not None:
+                try:
+                    with open(self._debug_log_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(debug_dict, ensure_ascii=False) + '\n')
+                except Exception:
+                    pass
+                self._debug_logged_count += 1
         return rewards
 
     def _debug_attn_state(self, model_kwargs: Dict[str, torch.Tensor], inner_model) -> None:
@@ -360,13 +374,14 @@ class DDAPOAttentionORM(ORM):
                     ids.add(int(tokenizer.convert_tokens_to_ids(tok)))
         return [i for i in ids if i is not None and i >= 0]
 
-    def _compute_tdr(self, attentions, batch: Dict[str, torch.Tensor], processor, model, system_len: int):
+    def _compute_tdr(self, attentions, batch: Dict[str, torch.Tensor], processor, model, system_len: int,
+                     return_debug: bool = False):
         # attentions: list of (B, H, S, S)
         input_ids = batch.get('input_ids')
         labels = batch.get('labels')
         attention_mask = batch.get('attention_mask')
         if input_ids is None or labels is None:
-            return None
+            return None, None
 
         input_ids = input_ids[0]
         labels = labels[0]
@@ -425,7 +440,35 @@ class DDAPOAttentionORM(ORM):
         rho_vis = torch.stack(rho_vis_list).mean()
         rho_text = torch.stack(rho_text_list).mean()
         tdr = rho_text / (rho_vis + self.eps)
-        return tdr.detach().item(), None
+
+        debug_dict = None
+        if return_debug:
+            # Full attention over all layers, head-averaged: (L, S, S)
+            attn_all = torch.stack([a[0].float().mean(dim=0) for a in attentions], dim=0)
+            # Generated tokens attention: (L, gen_len, S)
+            attn_full = attn_all[:, output_idx, :]
+            num_layers, gen_len, seq_len = attn_full.shape
+            prompt_text_idx = prompt_idx[text_in_prompt]
+            prompt_vis_idx = prompt_idx[vis_in_prompt]
+            attn_prompt_text_mean_by_layer = [
+                attn_full[l][:, prompt_text_idx].mean().item() for l in range(num_layers)
+            ]
+            attn_prompt_vis_mean_by_layer = [
+                attn_full[l][:, prompt_vis_idx].mean().item() for l in range(num_layers)
+            ]
+            debug_dict = {
+                'system_prefix_tokens': system_len,
+                'prompt_text_tokens': num_text,
+                'prompt_visual_tokens': num_vis,
+                'prompt_total_tokens': int(prompt_mask.sum().item()),
+                'generated_tokens': int(output_mask.sum().item()),
+                'attn_shape': [num_layers, int(gen_len), int(seq_len)],
+                'attn_prompt_text_mean_by_layer': attn_prompt_text_mean_by_layer,
+                'attn_prompt_vis_mean_by_layer': attn_prompt_vis_mean_by_layer,
+                'attn_full': attn_full.cpu().tolist(),
+            }
+
+        return tdr.detach().item(), debug_dict
 
     def _estimate_system_prefix_len_from_row(self, row: Dict[str, List], template) -> int:
         if row.get('messages') is None:
