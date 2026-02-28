@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 import argparse
-import io
 import json
 import os
 import re
 import shutil
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 from datasets import load_dataset
-from PIL import Image
+from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 
@@ -17,9 +16,15 @@ def parse_args():
         description='Prepare TIGER-Lab/ViRL39K for ms-swift GRPO local training.')
     parser.add_argument('--output_dir', required=True, help='Output directory path.')
     parser.add_argument('--cache_dir', default=None, help='Optional HF cache dir.')
+    parser.add_argument('--repo_id', default='TIGER-Lab/ViRL39K', help='HF dataset repo id.')
     parser.add_argument('--split', default='train', help='Dataset split to use.')
     parser.add_argument('--max_rows', type=int, default=0, help='0 for all, otherwise first N rows.')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output_dir.')
+    parser.add_argument(
+        '--image_mode',
+        default='as_is',
+        choices=['as_is', 'symlink', 'copy'],
+        help='How to handle images: as_is (use paths in HF cache), symlink or copy into output_dir/images.')
     return parser.parse_args()
 
 
@@ -35,33 +40,43 @@ def sanitize_id(raw: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]+', '_', str(raw))
 
 
-def _candidate_base_dirs(ds) -> List[str]:
-    base_dirs = set()
-    for item in getattr(ds, 'cache_files', []) or []:
-        filename = item.get('filename')
-        if filename:
-            base_dirs.add(os.path.dirname(filename))
-    return [d for d in base_dirs if d]
+def _find_parquet(repo_dir: str) -> str:
+    parquet_files: List[Tuple[int, str]] = []
+    for root, _, files in os.walk(repo_dir):
+        for name in files:
+            if name.endswith('.parquet'):
+                path = os.path.join(root, name)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = 0
+                parquet_files.append((size, path))
+    if not parquet_files:
+        raise FileNotFoundError(f'No parquet files found under: {repo_dir}')
+    parquet_files.sort(reverse=True)
+    return parquet_files[0][1]
 
 
-def _open_image_from_any(img, base_dirs: Iterable[str]) -> Optional[Image.Image]:
-    if img is None:
-        return None
-    if hasattr(img, 'save'):
-        return img
-    if isinstance(img, dict):
-        if 'bytes' in img and img['bytes'] is not None:
-            return Image.open(io.BytesIO(img['bytes']))
-        if 'path' in img and img['path']:
-            img = img['path']
-    if isinstance(img, str):
-        if os.path.exists(img):
-            return Image.open(img)
-        for base in base_dirs:
-            candidate = os.path.join(base, img)
-            if os.path.exists(candidate):
-                return Image.open(candidate)
-    return None
+def _verify_parquet_magic(path: str) -> None:
+    # Parquet files start and end with magic bytes "PAR1"
+    with open(path, 'rb') as f:
+        head = f.read(4)
+        if head != b'PAR1':
+            raise RuntimeError(
+                f'Parquet magic bytes not found in header: {path}. '
+                'This usually means the dataset was downloaded as a pointer file. '
+                'Please upgrade huggingface_hub (>=0.32) or install hf-xet, then retry.')
+        try:
+            f.seek(-4, os.SEEK_END)
+        except OSError:
+            raise RuntimeError(
+                f'Parquet file too small or invalid: {path}. '
+                'Please upgrade huggingface_hub (>=0.32) or install hf-xet, then retry.')
+        tail = f.read(4)
+        if tail != b'PAR1':
+            raise RuntimeError(
+                f'Parquet magic bytes not found in footer: {path}. '
+                'Please upgrade huggingface_hub (>=0.32) or install hf-xet, then retry.')
 
 
 def normalize_question(question: str) -> str:
@@ -81,13 +96,20 @@ def main():
     train_path = os.path.join(output_dir, 'train.jsonl')
 
     ensure_empty_dir(output_dir, args.overwrite)
-    os.makedirs(images_dir, exist_ok=True)
 
-    ds = load_dataset('TIGER-Lab/ViRL39K', split=args.split, cache_dir=args.cache_dir)
+    repo_dir = snapshot_download(
+        repo_id=args.repo_id,
+        repo_type='dataset',
+        cache_dir=args.cache_dir,
+    )
+    parquet_path = _find_parquet(repo_dir)
+    _verify_parquet_magic(parquet_path)
+    ds = load_dataset('parquet', data_files=parquet_path, split=args.split)
+
+    if args.image_mode in ('symlink', 'copy'):
+        os.makedirs(images_dir, exist_ok=True)
     total = len(ds)
     max_rows = args.max_rows if args.max_rows and args.max_rows > 0 else total
-    base_dirs = _candidate_base_dirs(ds)
-
     with open(train_path, 'w', encoding='utf-8') as f:
         for i, row in enumerate(tqdm(ds, total=min(total, max_rows), desc='Processing')):
             if i >= max_rows:
@@ -108,15 +130,25 @@ def main():
 
             image_paths: List[str] = []
             for j, img in enumerate(images):
-                pil = _open_image_from_any(img, base_dirs)
-                if pil is None:
+                if isinstance(img, dict) and 'path' in img:
+                    img = img['path']
+                if not isinstance(img, str):
                     continue
-                if pil.mode != 'RGB':
-                    pil = pil.convert('RGB')
-                img_filename = f'{qid_safe}-{j}.jpg'
-                img_path = os.path.join(images_dir, img_filename)
-                pil.save(img_path, quality=95)
-                image_paths.append(img_path)
+                src_path = img if os.path.isabs(img) else os.path.join(repo_dir, img)
+                if not os.path.exists(src_path):
+                    continue
+                if args.image_mode == 'as_is':
+                    image_paths.append(src_path)
+                else:
+                    img_filename = f'{qid_safe}-{j}{os.path.splitext(src_path)[1] or ".jpg"}'
+                    dst_path = os.path.join(images_dir, img_filename)
+                    if args.image_mode == 'symlink':
+                        if not os.path.exists(dst_path):
+                            os.symlink(src_path, dst_path)
+                    else:
+                        if not os.path.exists(dst_path):
+                            shutil.copy2(src_path, dst_path)
+                    image_paths.append(dst_path)
 
             if not image_paths:
                 continue
