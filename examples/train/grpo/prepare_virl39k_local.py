@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Download TIGER-Lab/ViRL39K and convert to ms-swift GRPO local format (train.jsonl + images/)."""
+"""Download ViRL39K from ModelScope (魔塔) and convert to ms-swift GRPO local format (train.jsonl + images/)."""
 import argparse
 import json
 import os
 import re
 import shutil
-from typing import Any
+from typing import Any, Optional
 
-from datasets import load_dataset
 from tqdm import tqdm
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Prepare ViRL39K (TIGER-Lab/ViRL39K) for ms-swift GRPO local training.')
+        description='Download ViRL39K from ModelScope and prepare for ms-swift GRPO local training.')
     parser.add_argument('--output_dir', required=True, help='Output directory path.')
-    parser.add_argument('--cache_dir', default=None, help='Optional HF cache dir.')
+    parser.add_argument('--dataset_id', default='TIGER-Lab/ViRL39K',
+                        help='ModelScope dataset id (default: TIGER-Lab/ViRL39K).')
+    parser.add_argument('--subset_name', default='default',
+                        help='Subset name on ModelScope (default: default).')
+    parser.add_argument('--cache_dir', default=None, help='Optional cache dir for ModelScope.')
     parser.add_argument('--max_rows', type=int, default=0, help='0 for all, otherwise first N rows.')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing output_dir.')
-    parser.add_argument('--num_proc', type=int, default=1, help='Number of processes (unused).')
+    parser.add_argument('--use_hf', action='store_true',
+                        help='Use HuggingFace instead of ModelScope when dataset not on 魔塔.')
     return parser.parse_args()
 
 
@@ -49,13 +53,16 @@ def save_image(image: Any, path: str) -> None:
     raise TypeError(f'Cannot save image type: {type(image)}')
 
 
-def get_first_image(row: dict, key: str = 'image') -> Any:
-    val = row.get(key)
-    if val is None:
-        return None
-    if isinstance(val, (list, tuple)):
-        return val[0] if val else None
-    return val
+def get_first_image(row: dict) -> Any:
+    """ViRL39K 可能使用 'image' 或 'images' 列."""
+    for key in ('image', 'images'):
+        val = row.get(key)
+        if val is None:
+            continue
+        if isinstance(val, (list, tuple)):
+            return val[0] if val else None
+        return val
+    return None
 
 
 def normalize_solution_for_reward(raw_answer: str) -> str:
@@ -67,6 +74,42 @@ def normalize_solution_for_reward(raw_answer: str) -> str:
     return f'<answer>{inner}</answer>' if inner else '<answer></answer>'
 
 
+def load_dataset_from_modelscope(dataset_id: str, subset_name: str, cache_dir: Optional[str]) -> Any:
+    """Load dataset from ModelScope (魔塔). Returns an iterable dataset."""
+    from modelscope import MsDataset
+    kwargs = {
+        'subset_name': subset_name,
+        'split': 'train',
+        'version': 'master',
+        'download_mode': 'reuse_dataset_if_exists',
+    }
+    if cache_dir:
+        kwargs['cache_dir'] = cache_dir
+    # MsDataset.load in newer versions may need trust_remote_code
+    try:
+        import modelscope
+        if getattr(modelscope, '__version__', '0') >= '1.29.1':
+            kwargs['trust_remote_code'] = True
+    except Exception:
+        pass
+    ds = MsDataset.load(dataset_id, **kwargs)
+    # ModelScope 返回的对象可能带有 _hf_ds（底层 HuggingFace Dataset）
+    if hasattr(ds, '_hf_ds'):
+        return ds._hf_ds
+    if hasattr(ds, 'to_hf_dataset'):
+        return ds.to_hf_dataset()
+    return ds
+
+
+def load_dataset_from_huggingface(dataset_id: str, cache_dir: Optional[str]) -> Any:
+    """Load dataset from HuggingFace (fallback when not on ModelScope)."""
+    from datasets import load_dataset
+    kwargs = {'split': 'train'}
+    if cache_dir:
+        kwargs['cache_dir'] = cache_dir
+    return load_dataset(dataset_id, **kwargs)
+
+
 def main():
     args = parse_args()
     output_dir = os.path.abspath(args.output_dir)
@@ -76,7 +119,13 @@ def main():
     ensure_empty_dir(output_dir, args.overwrite)
     os.makedirs(images_dir, exist_ok=True)
 
-    ds = load_dataset('TIGER-Lab/ViRL39K', split='train', cache_dir=args.cache_dir)
+    if args.use_hf:
+        print('Loading dataset from HuggingFace...')
+        ds = load_dataset_from_huggingface(args.dataset_id, args.cache_dir)
+    else:
+        print('Loading dataset from ModelScope (魔塔)...')
+        ds = load_dataset_from_modelscope(args.dataset_id, args.subset_name, args.cache_dir)
+
     total = len(ds)
     max_rows = args.max_rows if args.max_rows and args.max_rows > 0 else total
 
