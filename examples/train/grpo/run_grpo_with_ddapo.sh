@@ -9,6 +9,7 @@ swift rlhf \
     --model Qwen/Qwen2.5-VL-3B-Instruct \
     --external_plugins examples/train/grpo/plugin/plugin.py \
     --reward_funcs ddapo_attention external_r1v_acc format \
+    --reward_weight 1.0 4.0 1.0 \
     --use_vllm false \
     --tuner_type lora \
     --torch_dtype bfloat16 \
