@@ -12,7 +12,7 @@ swift rlhf \
     --use_vllm false \
     --tuner_type lora \
     --torch_dtype bfloat16 \
-    --dataset 'AI-ModelScope/clevr_cogen_a_train' \
+    --dataset /home/lujunxi57/ms-swift-rlvr/data/virl39k/train.jsonl \
     --overlong_filter false \
     --importance_sampling_level token \
     --epsilon 0.2 \
