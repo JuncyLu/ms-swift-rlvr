@@ -5,8 +5,10 @@ import json
 import os
 import re
 import shutil
-from typing import Any, Optional
+import zipfile
+from typing import Any, Iterator, Optional
 
+import requests
 from tqdm import tqdm
 
 
@@ -74,6 +76,85 @@ def normalize_solution_for_reward(raw_answer: str) -> str:
     return f'<answer>{inner}</answer>' if inner else '<answer></answer>'
 
 
+def _download_ms_dataset_file(dataset_id: str, file_path: str, local_path: str) -> None:
+    """从魔塔下载数据集中的单个文件（二进制安全）。"""
+    from modelscope.hub.api import ModelScopeConfig
+    url = (
+        f'https://www.modelscope.cn/api/v1/datasets/{dataset_id}/repo'
+        f'?Source=SDK&Revision=master&FilePath={file_path}'
+    )
+    cookies = ModelScopeConfig.get_cookies()
+    resp = requests.get(url, cookies=cookies, stream=True)
+    resp.raise_for_status()
+    os.makedirs(os.path.dirname(local_path) or '.', exist_ok=True)
+    total = int(resp.headers.get('content-length', 0)) or None
+    with open(local_path, 'wb') as f:
+        with tqdm(total=total, desc=file_path, unit='B', unit_scale=True, leave=False) as pbar:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+                    pbar.update(len(chunk))
+
+
+def load_dataset_from_modelscope_manual(
+    dataset_id: str,
+    cache_dir: Optional[str],
+    max_rows: int,
+) -> Iterator[dict]:
+    """
+    直接从魔塔下载 39Krelease.parquet 和 images.zip，本地解析，避免 MsDataset 内部
+    parquet 解析错误（Parquet magic bytes not found）。
+    """
+    import pandas as pd
+
+    cache_base = cache_dir or os.path.join(os.path.expanduser('~'), '.cache', 'modelscope', 'hub', 'datasets', 'virl39k_manual')
+    os.makedirs(cache_base, exist_ok=True)
+    parquet_path = os.path.join(cache_base, '39Krelease.parquet')
+    zip_path = os.path.join(cache_base, 'images.zip')
+    extracted_dir = os.path.join(cache_base, 'images_extracted')
+
+    for fpath, local in [('39Krelease.parquet', parquet_path), ('images.zip', zip_path)]:
+        if not os.path.exists(local) or os.path.getsize(local) == 0:
+            _download_ms_dataset_file(dataset_id, fpath, local)
+
+    if not os.path.isdir(extracted_dir) or not os.listdir(extracted_dir):
+        print('Extracting images.zip...')
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            z.extractall(extracted_dir)
+
+    print('Loading parquet with pandas...')
+    df = pd.read_parquet(parquet_path)
+    total = len(df)
+    n = min(total, max_rows) if max_rows > 0 else total
+
+    for i in range(n):
+        row = df.iloc[i]
+        qid = str(row.get('qid', i))
+        question = str(row.get('question', ''))
+        answer = str(row.get('answer', ''))
+        img = row.get('image') or row.get('images')
+        if img is None:
+            continue
+        # ViRL39K parquet: image 为路径列表，如 ["images/Processed-xxx-0.jpg"] 或 HF Image 结构 {"path": "..."}
+        if isinstance(img, (list, tuple)) and len(img) > 0:
+            first = img[0]
+            if isinstance(first, dict):
+                path_in_zip = first.get('path')
+                if path_in_zip is None:
+                    continue  # 仅有 bytes 的 HF Image 暂不处理
+                path_in_zip = str(path_in_zip)
+            else:
+                path_in_zip = str(first)
+        else:
+            path_in_zip = str(img)
+        if not path_in_zip:
+            continue
+        src = os.path.join(extracted_dir, path_in_zip)
+        if not os.path.isfile(src):
+            continue
+        yield {'qid': qid, 'question': question, 'answer': answer, 'image_path': src}
+
+
 def load_dataset_from_modelscope(dataset_id: str, subset_name: str, cache_dir: Optional[str]) -> Any:
     """Load dataset from ModelScope (魔塔). Returns an iterable dataset."""
     from modelscope import MsDataset
@@ -85,7 +166,6 @@ def load_dataset_from_modelscope(dataset_id: str, subset_name: str, cache_dir: O
     }
     if cache_dir:
         kwargs['cache_dir'] = cache_dir
-    # MsDataset.load in newer versions may need trust_remote_code
     try:
         import modelscope
         if getattr(modelscope, '__version__', '0') >= '1.29.1':
@@ -93,7 +173,6 @@ def load_dataset_from_modelscope(dataset_id: str, subset_name: str, cache_dir: O
     except Exception:
         pass
     ds = MsDataset.load(dataset_id, **kwargs)
-    # ModelScope 返回的对象可能带有 _hf_ds（底层 HuggingFace Dataset）
     if hasattr(ds, '_hf_ds'):
         return ds._hf_ds
     if hasattr(ds, 'to_hf_dataset'):
@@ -119,38 +198,56 @@ def main():
     ensure_empty_dir(output_dir, args.overwrite)
     os.makedirs(images_dir, exist_ok=True)
 
+    max_rows = args.max_rows if args.max_rows and args.max_rows > 0 else 0
+
     if args.use_hf:
         print('Loading dataset from HuggingFace...')
         ds = load_dataset_from_huggingface(args.dataset_id, args.cache_dir)
+        total = len(ds)
+        n = min(total, max_rows) if max_rows else total
+        with open(train_path, 'w', encoding='utf-8') as f:
+            for i, row in enumerate(tqdm(ds, total=n, desc='Processing')):
+                if max_rows and i >= max_rows:
+                    break
+                img = get_first_image(row)
+                if img is None:
+                    continue
+                qid = row.get('qid') or str(i)
+                img_filename = _sanitize_filename(str(qid)) + '.jpg'
+                img_path = os.path.join(images_dir, img_filename)
+                try:
+                    save_image(img, img_path)
+                except Exception:
+                    continue
+                question = row.get('question') or ''
+                answer = row.get('answer') or ''
+                record = {
+                    'messages': [{'role': 'user', 'content': question}],
+                    'images': img_path,
+                    'solution': normalize_solution_for_reward(answer),
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
     else:
-        print('Loading dataset from ModelScope (魔塔)...')
-        ds = load_dataset_from_modelscope(args.dataset_id, args.subset_name, args.cache_dir)
-
-    total = len(ds)
-    max_rows = args.max_rows if args.max_rows and args.max_rows > 0 else total
-
-    with open(train_path, 'w', encoding='utf-8') as f:
-        for i, row in enumerate(tqdm(ds, total=min(total, max_rows), desc='Processing')):
-            if i >= max_rows:
-                break
-            img = get_first_image(row)
-            if img is None:
-                continue
-            qid = row.get('qid') or str(i)
-            img_filename = _sanitize_filename(str(qid)) + '.jpg'
-            img_path = os.path.join(images_dir, img_filename)
-            try:
-                save_image(img, img_path)
-            except Exception:
-                continue
-            question = row.get('question') or ''
-            answer = row.get('answer') or ''
-            record = {
-                'messages': [{'role': 'user', 'content': question}],
-                'images': img_path,
-                'solution': normalize_solution_for_reward(answer),
-            }
-            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        print('Loading dataset from ModelScope (魔塔) - manual parquet+zip...')
+        it = load_dataset_from_modelscope_manual(args.dataset_id, args.cache_dir, max_rows)
+        count = 0
+        with open(train_path, 'w', encoding='utf-8') as f:
+            for row in tqdm(it, desc='Processing'):
+                qid = row['qid']
+                img_filename = _sanitize_filename(qid) + '.jpg'
+                dst_path = os.path.join(images_dir, img_filename)
+                try:
+                    shutil.copy2(row['image_path'], dst_path)
+                except Exception:
+                    continue
+                record = {
+                    'messages': [{'role': 'user', 'content': row['question']}],
+                    'images': dst_path,
+                    'solution': normalize_solution_for_reward(row['answer']),
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                count += 1
+        total = count
 
     print('Done.')
     print(f'Output dir: {output_dir}')
