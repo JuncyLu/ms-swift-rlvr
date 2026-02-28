@@ -152,14 +152,12 @@ class DDAPOAttentionORM(ORM):
     a scalar reward that favors lower TDR (more visual grounding).
     """
 
-    def __init__(self, k_layers: int = 8, eps: float = 1e-6, debug_samples: int = 10):
+    def __init__(self, k_layers: int = 8, eps: float = 1e-6):
         self.k_layers = k_layers
         self.eps = eps
-        self.debug_samples = debug_samples
         self._warned_missing = False
         self._warned_attn = False
         self._debug_done = False
-        self.debug_log_path = os.environ.get('DDAPO_DEBUG_LOG', 'ddapo_attention_debug.log')
 
     def __call__(self, completions, **kwargs) -> List[float]:
         model = kwargs.get('policy_model') or kwargs.get('model')
@@ -233,10 +231,8 @@ class DDAPOAttentionORM(ORM):
                 rewards.append(0.0)
                 continue
 
-            tdr, debug_payload = self._compute_tdr(attentions, batch, processor, model, system_len)
+            tdr, _ = self._compute_tdr(attentions, batch, processor, model, system_len)
             rewards.append(-float(tdr) if tdr is not None else 0.0)
-            if debug_payload is not None and idx < self.debug_samples:
-                self._write_debug_payload(debug_payload)
         return rewards
 
     def _debug_attn_state(self, model_kwargs: Dict[str, torch.Tensor], inner_model) -> None:
@@ -429,18 +425,7 @@ class DDAPOAttentionORM(ORM):
         rho_vis = torch.stack(rho_vis_list).mean()
         rho_text = torch.stack(rho_text_list).mean()
         tdr = rho_text / (rho_vis + self.eps)
-        debug_payload = None
-        if self.debug_samples > 0:
-            debug_payload = self._build_debug_payload(
-                attentions=attentions,
-                input_ids=input_ids,
-                output_idx=output_idx,
-                prompt_idx=prompt_idx,
-                vis_in_prompt=vis_in_prompt,
-                text_in_prompt=text_in_prompt,
-                system_len=system_len,
-            )
-        return tdr.detach().item(), debug_payload
+        return tdr.detach().item(), None
 
     def _estimate_system_prefix_len_from_row(self, row: Dict[str, List], template) -> int:
         if row.get('messages') is None:
@@ -469,48 +454,6 @@ class DDAPOAttentionORM(ORM):
             return len(full_ids) - len(no_sys_ids)
         return 0
 
-    def _build_debug_payload(self, attentions, input_ids, output_idx, prompt_idx, vis_in_prompt, text_in_prompt,
-                             system_len: int):
-        # Full attention matrices: per-layer, averaged over heads, for generated tokens.
-        attn_by_layer = []
-        layer_text_means = []
-        layer_vis_means = []
-        for layer_attn in attentions:
-            layer_attn = layer_attn[0].mean(dim=0)  # (S, S)
-            attn_by_layer.append(layer_attn[output_idx].tolist())
-            attn_prompt = layer_attn[output_idx][:, prompt_idx]  # (T, P)
-            if attn_prompt.numel() == 0:
-                layer_text_means.append(0.0)
-                layer_vis_means.append(0.0)
-            else:
-                vis_mask = vis_in_prompt
-                text_mask = text_in_prompt
-                vis_vals = attn_prompt[:, vis_mask]
-                text_vals = attn_prompt[:, text_mask]
-                layer_vis_means.append(float(vis_vals.mean().item()) if vis_vals.numel() > 0 else 0.0)
-                layer_text_means.append(float(text_vals.mean().item()) if text_vals.numel() > 0 else 0.0)
-
-        return {
-            'system_prefix_tokens': int(system_len),
-            'prompt_text_tokens': int(text_in_prompt.sum().item()),
-            'prompt_visual_tokens': int(vis_in_prompt.sum().item()),
-            'prompt_total_tokens': int(prompt_idx.numel()),
-            'generated_tokens': int(output_idx.numel()),
-            'attn_shape': [len(attentions), int(output_idx.numel()), int(input_ids.numel())],
-            'attn_prompt_text_mean_by_layer': layer_text_means,
-            'attn_prompt_vis_mean_by_layer': layer_vis_means,
-            'attn_full': attn_by_layer,
-        }
-
-    def _write_debug_payload(self, payload: Dict) -> None:
-        # Only rank 0 writes to avoid duplicate logs.
-        if os.environ.get('RANK', '0') != '0':
-            return
-        try:
-            with open(self.debug_log_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(payload, ensure_ascii=False) + '\n')
-        except Exception as e:
-            logger.warning('[DDAPO_DEBUG] Failed to write debug payload: %s', e)
 
 
 orms['ddapo_attention'] = DDAPOAttentionORM
