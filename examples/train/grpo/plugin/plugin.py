@@ -8,7 +8,7 @@ import textwrap
 import torch
 from collections import Counter
 from copy import deepcopy
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 from swift.infer_engine import RequestConfig, TransformersEngine
 from swift.infer_engine.protocol import ChatCompletionResponse, ChatCompletionResponseChoice, RolloutInferRequest
@@ -157,10 +157,11 @@ class DDAPOAttentionORM(ORM):
         self.eps = eps
         self._warned_missing = False
         self._warned_attn = False
-        self._debug_done = False
-        self._debug_n = int(os.environ.get('DDAPO_DEBUG_N', '10'))
-        self._debug_log_path = os.environ.get('DDAPO_DEBUG_LOG', 'ddapo_attention_debug.log')
-        self._debug_logged_count = 0
+        # DDAPO_REWARD_CENTER=1 时 reward=-(tdr-1)，使样本间差异更明显
+        self._reward_center = int(os.environ.get('DDAPO_REWARD_CENTER', '0'))
+        # DDAPO_GROUP_NORM=1 时在同一 prompt 的多个样本内做归一化，TDR 越大惩罚越高（reward 越负）
+        self._group_norm = int(os.environ.get('DDAPO_GROUP_NORM', '1'))
+        self._num_generations = int(os.environ.get('DDAPO_NUM_GENERATIONS', '4'))
 
     def __call__(self, completions, **kwargs) -> List[float]:
         model = kwargs.get('policy_model') or kwargs.get('model')
@@ -182,14 +183,15 @@ class DDAPOAttentionORM(ORM):
                 self._warned_missing = True
             return [0.0 for _ in completions]
 
-        rewards: List[float] = []
+        num_generations = kwargs.get('num_generations', self._num_generations)
+        tdr_list: List[Optional[float]] = []  # 先收集所有 TDR，组内归一化时再算 reward
         for idx, completion in enumerate(completions):
             row = {}
             for key in ['messages', 'images', 'videos', 'audios', 'tools', 'objects', 'mm_processor_kwargs']:
                 if key in kwargs and kwargs[key] is not None:
                     row[key] = kwargs[key][idx]
             if 'messages' not in row or row['messages'] is None:
-                rewards.append(0.0)
+                tdr_list.append(None)
                 continue
 
             messages = deepcopy(row['messages'])
@@ -202,7 +204,7 @@ class DDAPOAttentionORM(ORM):
             std_inputs = StdTemplateInputs.from_dict(row)
             encoded = template._encode_truncated(std_inputs)
             if encoded.get('input_ids') is None or encoded.get('labels') is None:
-                rewards.append(0.0)
+                tdr_list.append(None)
                 continue
 
             batch = template._data_collator([encoded])
@@ -214,9 +216,6 @@ class DDAPOAttentionORM(ORM):
             # Temporarily disable gradient checkpointing so forward returns attentions (required for DDAPO TDR).
             inner_model = getattr(model, 'module', model)
             gcp_kwargs = kwargs.get('gradient_checkpointing_kwargs')
-            if idx == 0 and not self._debug_done:
-                self._debug_attn_state(model_kwargs, inner_model)
-                self._debug_done = True
 
             saved_attn_impl = self._set_attn_impl_eager(inner_model)
             try:
@@ -231,42 +230,57 @@ class DDAPOAttentionORM(ORM):
                 if not self._warned_attn:
                     logger.warning('DDAPOAttentionORM: model outputs did not include attentions. Returning 0.0 reward.')
                     self._warned_attn = True
-                rewards.append(0.0)
+                tdr_list.append(None)
                 continue
 
-            is_rank0 = (int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', 0))) == 0)
-            want_debug = is_rank0 and (self._debug_logged_count < self._debug_n)
-            tdr, debug_dict = self._compute_tdr(attentions, batch, processor, model, system_len,
-                                                return_debug=want_debug)
-            rewards.append(-float(tdr) if tdr is not None else 0.0)
+            tdr = self._compute_tdr(attentions, batch, processor, model, system_len)
+            if tdr is not None:
+                tdr_list.append(float(tdr))
+            else:
+                tdr_list.append(None)
 
-            if debug_dict is not None:
-                try:
-                    with open(self._debug_log_path, 'a', encoding='utf-8') as f:
-                        f.write(json.dumps(debug_dict, ensure_ascii=False) + '\n')
-                except Exception:
-                    pass
-                self._debug_logged_count += 1
+        # 组内归一化：同一 prompt 的 num_generations 个样本为一组，TDR 越大 reward 越负
+        rewards = self._tdr_to_rewards_group_norm(tdr_list, num_generations)
+        # 供 trainer 写入 completions.jsonl 的原始 TDR 数组（每条回复一个值）
+        extra = kwargs.setdefault('_extra_logs', {})
+        extra['DDAPO_tdr'] = [float(x) if x is not None else None for x in tdr_list]
         return rewards
 
-    def _debug_attn_state(self, model_kwargs: Dict[str, torch.Tensor], inner_model) -> None:
-        keys = sorted(model_kwargs.keys())
-        has_output_attn = 'output_attentions' in model_kwargs
-        logger.info('[DDAPO_DEBUG] model_kwargs keys: %s', keys)
-        logger.info('[DDAPO_DEBUG] output_attentions=%s', model_kwargs.get('output_attentions', None))
-        logger.info('[DDAPO_DEBUG] gradient_checkpointing=%s', getattr(inner_model, 'gradient_checkpointing', None))
-        logger.info('[DDAPO_DEBUG] config.gradient_checkpointing=%s',
-                    getattr(getattr(inner_model, 'config', None), 'gradient_checkpointing', None))
+    def _tdr_to_rewards_group_norm(self, tdr_list: List[Optional[float]], num_generations: int) -> List[float]:
+        """同一 prompt 的多个样本内归一化：TDR 越大惩罚越高（reward 越负）。组内 z-score：reward = -(t - mean) / std。"""
+        n = len(tdr_list)
+        rewards: List[float] = []
+        if not self._group_norm or num_generations <= 0:
+            for t in tdr_list:
+                if t is not None:
+                    if self._reward_center:
+                        rewards.append(-(t - 1.0))
+                    else:
+                        rewards.append(-t)
+                else:
+                    rewards.append(0.0)
+            return rewards
 
-        def _log_config(prefix: str, cfg):
-            if cfg is None:
-                return
-            for key in AttnImpl.attn_impl_keys:
-                if hasattr(cfg, key):
-                    logger.info('[DDAPO_DEBUG] %s.%s=%s', prefix, key, getattr(cfg, key))
-
-        _log_config('config', getattr(inner_model, 'config', None))
-        _log_config('config.text_config', getattr(getattr(inner_model, 'config', None), 'text_config', None))
+        num_groups = (n + num_generations - 1) // num_generations
+        for g in range(num_groups):
+            start = g * num_generations
+            end = min(start + num_generations, n)
+            group_tdr = tdr_list[start:end]
+            valid_tdr = [t for t in group_tdr if t is not None]
+            if not valid_tdr:
+                rewards.extend([0.0] * len(group_tdr))
+                continue
+            mean_t = sum(valid_tdr) / len(valid_tdr)
+            variance = sum((x - mean_t) ** 2 for x in valid_tdr) / len(valid_tdr)
+            std_t = (variance ** 0.5) + self.eps
+            for t in group_tdr:
+                if t is not None:
+                    # TDR 越大 reward 越负：组内 z-score 归一化，reward = -(t - mean) / std
+                    r = -(float(t) - mean_t) / std_t
+                    rewards.append(float(r))
+                else:
+                    rewards.append(0.0)
+        return rewards
 
     def _set_attn_impl_eager(self, inner_model):
         saved = []
@@ -374,14 +388,13 @@ class DDAPOAttentionORM(ORM):
                     ids.add(int(tokenizer.convert_tokens_to_ids(tok)))
         return [i for i in ids if i is not None and i >= 0]
 
-    def _compute_tdr(self, attentions, batch: Dict[str, torch.Tensor], processor, model, system_len: int,
-                     return_debug: bool = False):
+    def _compute_tdr(self, attentions, batch: Dict[str, torch.Tensor], processor, model, system_len: int):
         # attentions: list of (B, H, S, S)
         input_ids = batch.get('input_ids')
         labels = batch.get('labels')
         attention_mask = batch.get('attention_mask')
         if input_ids is None or labels is None:
-            return None, None
+            return None
 
         input_ids = input_ids[0]
         labels = labels[0]
@@ -393,19 +406,19 @@ class DDAPOAttentionORM(ORM):
         output_mask = (labels != -100) & (attention_mask == 1)
         prompt_mask = (labels == -100) & (attention_mask == 1)
         if output_mask.sum() == 0 or prompt_mask.sum() == 0:
-            return None, None
+            return None
 
         if system_len > 0:
             system_prefix_mask = torch.zeros_like(prompt_mask, dtype=torch.bool)
             system_prefix_mask[:system_len] = True
             prompt_mask = prompt_mask & (~system_prefix_mask)
             if prompt_mask.sum() == 0:
-                return None, None
+                return None
 
         visual_token_ids = self._collect_visual_token_ids(processor, model)
         # Construct visual mask via ids; non-visual in prompt treated as text
         if not visual_token_ids:
-            return None, None
+            return None
         visual_mask = torch.isin(input_ids, torch.tensor(visual_token_ids, device=input_ids.device))
 
         prompt_idx = prompt_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -415,7 +428,7 @@ class DDAPOAttentionORM(ORM):
         num_vis = int(vis_in_prompt.sum().item())
         num_text = int(text_in_prompt.sum().item())
         if num_vis == 0 or num_text == 0:
-            return None, None
+            return None
 
         k_layers = min(self.k_layers, len(attentions))
         attn_stack = torch.stack(attentions[-k_layers:], dim=0)  # (K, B, H, S, S)
@@ -440,35 +453,8 @@ class DDAPOAttentionORM(ORM):
         rho_vis = torch.stack(rho_vis_list).mean()
         rho_text = torch.stack(rho_text_list).mean()
         tdr = rho_text / (rho_vis + self.eps)
-
-        debug_dict = None
-        if return_debug:
-            # Full attention over all layers, head-averaged: (L, S, S)
-            attn_all = torch.stack([a[0].float().mean(dim=0) for a in attentions], dim=0)
-            # Generated tokens attention: (L, gen_len, S)
-            attn_full = attn_all[:, output_idx, :]
-            num_layers, gen_len, seq_len = attn_full.shape
-            prompt_text_idx = prompt_idx[text_in_prompt]
-            prompt_vis_idx = prompt_idx[vis_in_prompt]
-            attn_prompt_text_mean_by_layer = [
-                attn_full[l][:, prompt_text_idx].mean().item() for l in range(num_layers)
-            ]
-            attn_prompt_vis_mean_by_layer = [
-                attn_full[l][:, prompt_vis_idx].mean().item() for l in range(num_layers)
-            ]
-            debug_dict = {
-                'system_prefix_tokens': system_len,
-                'prompt_text_tokens': num_text,
-                'prompt_visual_tokens': num_vis,
-                'prompt_total_tokens': int(prompt_mask.sum().item()),
-                'generated_tokens': int(output_mask.sum().item()),
-                'attn_shape': [num_layers, int(gen_len), int(seq_len)],
-                'attn_prompt_text_mean_by_layer': attn_prompt_text_mean_by_layer,
-                'attn_prompt_vis_mean_by_layer': attn_prompt_vis_mean_by_layer,
-                'attn_full': attn_full.cpu().tolist(),
-            }
-
-        return tdr.detach().item(), debug_dict
+        tdr_val = tdr.detach().item()
+        return tdr_val
 
     def _estimate_system_prefix_len_from_row(self, row: Dict[str, List], template) -> int:
         if row.get('messages') is None:

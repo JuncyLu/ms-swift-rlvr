@@ -363,9 +363,42 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     pass
                 # Synchronous reward function
                 else:
+                    reward_kwargs['_extra_logs'] = {}
                     output_reward_func = reward_func(completions, **reward_kwargs)
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                    # 将 reward 函数通过 _extra_logs 提供的额外字段（如 DDAPO_tdr）写入 _logs，便于 completions.jsonl 输出
+                    extra = reward_kwargs.pop('_extra_logs', None)
+                    if extra:
+                        for k, v in extra.items():
+                            if k not in self._logs:
+                                self._logs[k] = deque(maxlen=self.args.generation_batch_size)
+                            self._logs[k].extend(v)
+                        # 多卡时按「同一 prompt」合并为一组：先汇总各卡 TDR，再在全局做 z-score 归一化
+                        if 'DDAPO_tdr' in extra and self.accelerator.num_processes > 1:
+                            local_tdr = extra['DDAPO_tdr']
+                            gathered_tdr = gather_object([local_tdr])
+                            full_tdr_list = [t for rank_list in gathered_tdr for t in rank_list]
+                            valid_tdr = [t for t in full_tdr_list if t is not None]
+                            if valid_tdr:
+                                mean_t = sum(valid_tdr) / len(valid_tdr)
+                                variance = sum((x - mean_t) ** 2 for x in valid_tdr) / len(valid_tdr)
+                                std_t = (variance ** 0.5) + 1e-6
+                                full_rewards = [
+                                    -(float(t) - mean_t) / std_t if t is not None else 0.0
+                                    for t in full_tdr_list
+                                ]
+                            else:
+                                full_rewards = [0.0] * len(full_tdr_list)
+                            gathered_lengths = [len(lst) for lst in gathered_tdr]
+                            my_offset = sum(gathered_lengths[:self.accelerator.process_index])
+                            my_rewards = full_rewards[my_offset:my_offset + len(local_tdr)]
+                            rewards_per_func[:, i] = torch.tensor(
+                                my_rewards, dtype=torch.float32, device=device)
+                            # 主进程写入全局 TDR 到 _logs，保证 completions.jsonl 里每行条数与 prompt 一致
+                            if self.accelerator.is_main_process:
+                                self._logs['DDAPO_tdr'].clear()
+                                self._logs['DDAPO_tdr'].extend(full_tdr_list)
 
         # Execute async reward functions in parallel using asyncio.gather
         # Process in original order to maintain correspondence with reward_func_names
