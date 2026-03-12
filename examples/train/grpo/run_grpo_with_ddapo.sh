@@ -11,7 +11,6 @@ swift rlhf \
     --reward_funcs ddapo_attention external_r1v_acc format \
     --reward_weight 1.0 4.0 1.0 \
     --use_vllm false \
-    --tuner_type lora \
     --torch_dtype bfloat16 \
     --dataset /home/lujunxi57/ms-swift-rlvr/data/virl39k/train.jsonl \
     --overlong_filter false \
